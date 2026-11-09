@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: coldchain-zhiyun-2608259
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn.conf.py cloud_app:app
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.13
+      - key: COLDCHAIN_HTTPS
+        value: "1"
+      - key: COLDCHAIN_OUTPUT_DIR
+        value: /tmp/coldchain-outputs
+      - key: COLDCHAIN_SESSION_SECRET
+        generateValue: true
