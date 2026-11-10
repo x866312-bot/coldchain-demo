@@ -5,6 +5,55 @@ from .solver import optimize_routes
 from .data import coordinate_network
 
 
+def _feasibility_diagnostics(problem, execution, result, states):
+    """Return conservative, evidence-based reasons for each unserved order."""
+    if result['status'] == 'feasible':
+        return []
+    orders, idx = context(problem)
+    available = [v for v in problem['vehicles'] if v.get('available', True)]
+    pending = [o for o in problem['orders'] if o['id'] not in execution['completed']]
+    total_demand = sum(o['demand'] for o in pending)
+    total_capacity = sum(v['capacity'] for v in available)
+    diagnostics = []
+    for oid in result['unserved_orders']:
+        order = orders[oid]
+        if not available:
+            code, label = 'vehicle_availability', '车辆可用性不足'
+            detail = '事件后没有可参与重规划的车辆。'
+            suggestion = '恢复至少一辆车辆，或调整车辆停运事件。'
+        elif order['demand'] > max(v['capacity'] for v in available) + 1e-8:
+            code, label = 'capacity', '单车运力不足'
+            detail = f"订单需求{order['demand']:.2f} kg，超过可用车辆最大容量{max(v['capacity'] for v in available):.2f} kg。"
+            suggestion = '拆分订单、增加大容量车辆或调整需求量。'
+        elif total_demand > total_capacity + 1e-8:
+            code, label = 'capacity', '系统总运力不足'
+            detail = f"待执行需求{total_demand:.2f} kg，超过可用车辆总容量{total_capacity:.2f} kg。"
+            suggestion = '增加可用车辆、拆分批次或延后部分订单。'
+        elif order['due'] < execution['time'] - 1e-8:
+            code, label = 'event_time', '事件时刻已晚于截止时间'
+            detail = f"事件时刻为{execution['time']:.2f} min，订单截止时间为{order['due']:.2f} min。"
+            suggestion = '放宽截止时间，或在更早的执行状态触发插单。'
+        else:
+            earliest = min(states[v['id']]['ready_time'] + problem['time_matrix'][0][idx[oid]] for v in available)
+            if earliest > order['due'] + 1e-8:
+                code, label = 'time_window', '硬时间窗不可达'
+                detail = f"完成回仓重配后最早约{earliest:.2f} min到达，晚于截止时间{order['due']:.2f} min。"
+                suggestion = '放宽时间窗、缩短行驶时间或配置更近的可用车辆。'
+            else:
+                code, label = 'combined_constraints', '组合约束冲突'
+                detail = '单项下界检查可通过，但容量、访问顺序和多个硬时间窗组合后没有生成完整可行路线。'
+                suggestion = '增加车辆或迭代次数，并检查相邻订单时间窗是否过于集中。'
+        diagnostics.append(dict(code=code, label=label, order_id=oid,
+                                detail=detail, suggestion=suggestion))
+    if not diagnostics:
+        violations = result.get('constraint_violations') or []
+        diagnostics.append(dict(
+            code='independent_validation', label='独立约束校验未通过', order_id='完整计划',
+            detail='；'.join(violations[:3]) if violations else '求解器未生成可通过全部硬约束的完整路线。',
+            suggestion='检查车辆可用性、容量和时间窗，并适当增加迭代次数。'))
+    return diagnostics
+
+
 def advance_execution(p, solution, execution=None):
     """可复现的离散执行仿真：每辆车完成下一客户后停车，统一时刻触发事件。
 
@@ -43,14 +92,24 @@ def replan_routes(problem, execution, event, objective='cost', solver_config=Non
     orders, idx = context(p)
     if kind == 'new_order':
         order = event.get('order')
-        if not isinstance(order, dict) or order.get('id') in orders:
-            raise ValueError('新订单缺失或id重复')
+        if not isinstance(order, dict):
+            raise ValueError('请完整填写新订单字段')
+        if not isinstance(order.get('id'), str) or not order['id'].strip():
+            raise ValueError('新订单ID必须为非空文本')
+        order['id'] = order['id'].strip()
+        if order['id'] in orders:
+            raise ValueError(f"订单ID {order['id']} 已存在，请使用唯一ID")
+        if number(order.get('demand'), '新订单需求') <= 0:
+            raise ValueError('新订单需求必须大于0 kg')
+        ready, due = number(order.get('ready'), '时间窗起点'), number(order.get('due'), '时间窗终点')
+        if ready > due:
+            raise ValueError('新订单时间窗起点不能晚于终点')
         n = len(p['orders'])+1
         # Synthetic coordinate demo only. Real data must supply both directional edges.
         if event.get('use_demo_coordinates'):
             network = coordinate_network(p)
             if network is None:
-                raise ValueError('当前数据的坐标或矩阵不符合模板欧氏距离/40 km/h模型，无法推算新增路段。请在自定义事件JSON中提供双向距离和时间。')
+                raise ValueError('当前数据不是可按坐标推算的模板网络；请在数据文件中加入新订单及双向距离/时间矩阵后重新上传')
             p['depot'] = network['depot']
             x, y = number(order.get('x'), 'x'), number(order.get('y'), 'y')
             pts = [p['depot']] + p['orders']
@@ -73,7 +132,7 @@ def replan_routes(problem, execution, event, objective='cost', solver_config=Non
         if not matches:
             raise ValueError('车辆不存在')
         if ex['vehicles'].get(vid, {}).get('location', 'DEPOT') != 'DEPOT':
-            raise ValueError('该车辆在途：缺少救援/货物转运数据，不能假设货物瞬移。此版本仅支持发车前车辆不可用。')
+            raise ValueError('该车辆正在执行途中任务；请先推进到服务边界，并补充救援与货物转运条件')
         matches[0]['available'] = False
     else:
         oid = event.get('order_id')
@@ -102,6 +161,7 @@ def replan_routes(problem, execution, event, objective='cost', solver_config=Non
     result['execution_snapshot'] = ex
     result['vehicle_start_states'] = states
     result['event'] = event
+    result['feasibility_diagnostics'] = _feasibility_diagnostics(p, ex, result, states)
     result['dynamic_policy'] = '服务边界停车；所有在途车辆从当前位置回仓，统一到齐后卸货重配；含回仓等待制冷，装卸时间暂设0，须业务校准'
     result['comparison'] = dict(baseline='同一事件、同一执行状态下最小增量插入',
                                 comparable=result['status']=='feasible' and result['baseline']['status']=='feasible',

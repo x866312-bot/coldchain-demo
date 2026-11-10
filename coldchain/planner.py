@@ -1,4 +1,4 @@
-"""单主控Agent + 白名单工具；离线模式明确标注规则解析。"""
+"""单主控Agent + 白名单工具；规则推理与模型函数调用共享工具协议。"""
 import json
 import os
 import re
@@ -27,14 +27,14 @@ def parse_request(message):
                 data = json.load(response)
             calls = data['choices'][0]['message']['tool_calls']
             if len(calls) != 1 or calls[0]['function']['name'] != 'dispatch':
-                raise ValueError('不支持的工具调用')
+                raise ValueError('模型返回了白名单以外的工具调用')
             parsed = json.loads(calls[0]['function']['arguments'])
             if set(parsed) != {'task', 'objective', 'reason'} or parsed['task'] not in SCHEMA['properties']['task']['enum'] or parsed['objective'] not in ('cost','carbon','distance') or not isinstance(parsed['reason'],str):
                 raise ValueError('模型输出不符合工具schema')
             return dict(parsed, mode='llm_function_calling', token_usage=data.get('usage', {}), api_cost_cny=None)
         except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError) as exc:
-            raise ValueError('大模型请求失败或输出不合法；未执行任何工具。请检查配置或切换离线模式。') from exc
-    # Conservative offline grammar: unknown constraints never silently disappear.
+            raise ValueError('模型服务请求失败或输出不合法；当前状态未修改，请检查模型配置后重试。') from exc
+    # Conservative rule reasoning: unknown constraints never silently disappear.
     objective = 'carbon' if re.search('低碳|碳排|减碳', message) else 'distance' if re.search('距离|路程|最短', message) else 'cost'
     if re.search('新增|增加.*订单|故障|不可用|重规划|重调度|修改.*时间窗', message):
         task = 'replan_routes'
@@ -46,14 +46,22 @@ def parse_request(message):
         task = 'clarify'
     if re.search(r'\d|不超过|最多|至少|软时间窗|忽略|取消|提高|降低容量|温度|优先级', message) or ('低碳' in message and '低成本' in message):
         task = 'clarify'
-    return dict(task=task, objective=objective, reason='离线规则解析；数值约束请通过标准数据或事件表单明确提供', mode='offline_rules', token_usage={}, api_cost_cny=None)
+    return dict(task=task, objective=objective, reason='规则推理已匹配任务与目标；数值约束由标准数据或事件表单提供', mode='offline_rules', token_usage={}, api_cost_cny=None)
 
 
 def explain(result):
     k = result['kpis']
     if result['status'] != 'feasible':
-        return f"未找到完整可行方案；未服务{len(result['unserved_orders'])}单。请检查运力、时间窗和事件时刻。这不是数学上的无解证明，当前部分方案不可作为完整调度计划执行。"
-    return (f"独立约束校验通过。待执行订单服务率{result['service_rate']:.0%}，"
+        diagnostics = result.get('feasibility_diagnostics', [])
+        labels = list(dict.fromkeys(d['label'] for d in diagnostics))
+        details = '；'.join(f"{d['order_id']}：{d['detail']}" for d in diagnostics[:3])
+        reason = f"原因定位：{'、'.join(labels)}。{details}" if diagnostics else '请检查运力、时间窗和事件时刻。'
+        return (f"未找到完整可行方案；未服务{len(result['unserved_orders'])}单。{reason}"
+                "当前结果是求解与下界检查得到的诊断，不构成数学无解证明，部分路线不可作为完整计划执行。")
+    objective = {'cost': '已按最低运营成本目标完成路线优化。',
+                 'carbon': '已按最低模型估算排放目标完成路线优化。',
+                 'distance': '已按最短配送距离目标完成路线优化。'}.get(result.get('objective'), '')
+    return (f"{objective}独立约束校验通过。待执行订单服务率{result['service_rate']:.0%}，"
             f"距离{k['distance_km']:.2f} km，成本{k['total_cost_cny']:.2f}元，"
             f"按输入系数估算排放{k['emissions_kgco2']:.2f} kg CO₂。"
             f"口径：{result['cost_scope']}。所有数值来自工具计算，排放是模型估算。")

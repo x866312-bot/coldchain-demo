@@ -12,7 +12,7 @@ from coldchain.data import demo_problem, read_excel, coordinate_network
 from coldchain.model import normalize, evaluate_route, validate_solution
 from coldchain.solver import optimize_routes
 from coldchain.replanning import advance_execution, replan_routes
-from coldchain.planner import parse_request
+from coldchain.planner import parse_request, explain
 from server import app, stores
 
 CFG = dict(iterations=40, seed=42, time_limit_seconds=10)
@@ -130,6 +130,29 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(p['distance_matrix'][0][-1],2)
         self.assertEqual(p['distance_matrix'][-1][0],3)
 
+    def test_infeasible_new_order_reports_capacity_reason(self):
+        solution = optimize_routes(self.p, solver_config=CFG)
+        execution = advance_execution(self.p, solution)
+        event = dict(type='new_order', use_demo_coordinates=True,
+                     order=dict(id='N-CAP', demand=1000, ready=0, due=420,
+                                service=5, x=27, y=32))
+        _, result = replan_routes(self.p, execution, event, solver_config=CFG)
+        self.assertEqual(result['status'], 'no_feasible_solution_found')
+        diagnostic = next(x for x in result['feasibility_diagnostics'] if x['order_id'] == 'N-CAP')
+        self.assertEqual(diagnostic['code'], 'capacity')
+        self.assertIn('运力', diagnostic['label'])
+        self.assertIn('N-CAP', explain(result))
+
+    def test_infeasible_new_order_reports_event_time_reason(self):
+        solution = optimize_routes(self.p, solver_config=CFG)
+        execution = advance_execution(self.p, solution)
+        event = dict(type='new_order', use_demo_coordinates=True,
+                     order=dict(id='N-LATE', demand=1, ready=0,
+                                due=max(0, execution['time']-1), service=1, x=27, y=32))
+        _, result = replan_routes(self.p, execution, event, solver_config=CFG)
+        diagnostic = next(x for x in result['feasibility_diagnostics'] if x['order_id'] == 'N-LATE')
+        self.assertEqual(diagnostic['code'], 'event_time')
+
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
@@ -203,6 +226,41 @@ class ApiTests(unittest.TestCase):
         self.client.post('/api/optimize',json={'solver_config':CFG})
         r=self.client.post('/api/agent',json={'message':'新增订单重新规划'}).get_json()
         self.assertIn('clarification',r)
+
+    def test_prompt_examples_select_distinct_tools_and_targets(self):
+        cost = self.client.post('/api/agent', json=dict(
+            message='在满足车辆载重和硬时间窗的前提下，生成总运营成本最低的配送方案，并汇报校验结果。',
+            solver_config=CFG)).get_json()
+        self.assertEqual(cost['trace'][0]['task'], 'optimize_routes')
+        self.assertEqual(cost['trace'][0]['objective'], 'cost')
+        carbon = self.client.post('/api/agent', json=dict(
+            message='以模型估算碳排放最低为目标重新规划配送路线，同时检查容量、时间窗和客户唯一覆盖约束。',
+            solver_config=CFG)).get_json()
+        self.assertEqual(carbon['trace'][0]['task'], 'optimize_routes')
+        self.assertEqual(carbon['trace'][0]['objective'], 'carbon')
+        diagnosis = self.client.post('/api/agent', json=dict(
+            message='分析当前配送方案，解释成本、碳排、服务率及约束校验结果，并指出需要关注的风险。')).get_json()
+        self.assertEqual(diagnosis['trace'][0]['task'], 'calculate_kpis')
+        self.assertEqual(diagnosis['solution']['solution_id'], carbon['solution']['solution_id'])
+
+    def test_diagnosis_before_optimization_gives_actionable_clarification(self):
+        response = self.client.post('/api/agent', json=dict(
+            message='分析当前配送方案，解释成本、碳排、服务率及约束校验结果。'))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('请先执行', response.get_json()['clarification'])
+
+    def test_replan_api_returns_structured_failure_diagnostics(self):
+        self.client.post('/api/optimize', json={'solver_config': CFG})
+        self.client.post('/api/advance', json={})
+        event = dict(type='new_order', use_demo_coordinates=True,
+                     order=dict(id='N-CAP', demand=1000, ready=0, due=420,
+                                service=5, x=27, y=32))
+        response = self.client.post('/api/replan', json=dict(event=event, solver_config=CFG))
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload['solution']['status'], 'no_feasible_solution_found')
+        self.assertEqual(payload['solution']['feasibility_diagnostics'][0]['code'], 'capacity')
+        self.assertIn('原因定位', payload['explanation'])
 
     def test_bad_json_shape(self):
         self.assertEqual(self.client.post('/api/optimize',json=[]).status_code,400)

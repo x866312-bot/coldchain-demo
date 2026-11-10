@@ -183,8 +183,10 @@ def dispatch():
             return jsonify(success=True, clarification='请明确单一目标（成本/碳排/距离）。容量和时间窗请通过数据文件修改；动态事件请填写事件表单，系统不会忽略未识别约束。', trace=trace)
         if task == 'calculate_kpis':
             if not state['solution']:
-                raise ValueError('尚无方案，请先优化')
-            return jsonify(success=True, solution=state['solution'], explanation=explain(state['solution']), trace=trace)
+                return jsonify(success=True, clarification='当前没有可诊断的配送方案。请先执行“成本优先”或“低碳优先”生成方案，再使用方案诊断。', trace=trace)
+            return jsonify(success=True, solution=state['solution'],
+                           explanation='已读取当前方案并完成指标诊断；本次未改变路线。'+explain(state['solution']),
+                           trace=trace)
         if task == 'replan_routes':
             if not state['solution']:
                 raise ValueError('请先生成初始方案')
